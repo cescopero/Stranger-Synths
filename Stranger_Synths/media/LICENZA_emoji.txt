@@ -1,0 +1,1 @@
+Grafica dei gesti: Twemoji (https://github.com/jdecked/twemoji), licenza CC-BY 4.0. Autori: Twitter, Inc. e collaboratori. I file sono stati ridimensionati (PNG 512x512).

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MediaPipe OSC</title>
+<style>
+  :root {
+    --bg: #15171a;
+    --panel: #1d2024;
+    --panel-raised: #24272c;
+    --line: #34383e;
+    --text: #e8e6e0;
+    --text-dim: #8a8f97;
+    --accent: #ff6a3d;
+    --ok: #5fd97a;
+    --err: #e85d5d;
+    --mono: "SF Mono", "JetBrains Mono", "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); font-family: var(--mono);
+    min-height: 100vh; padding: 16px;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  .device {
+    width: 100%; max-width: 720px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  }
+  .header {
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel-raised);
+    font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim);
+  }
+  .body { padding: 14px 16px 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+  button.tgl {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+    border-radius: 5px; border: 1px solid var(--line); padding: 9px 14px;
+    cursor: pointer; background: var(--panel); color: var(--text-dim);
+    transition: all .15s ease;
+  }
+  button.tgl.on { border-color: var(--err); color: var(--err); background: var(--panel-raised); }
+  button.tgl#btn-camera.on { border-color: var(--ok); color: var(--ok); }
+  label.f { font-size: 10px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+  input.f {
+    font-family: var(--mono); font-size: 12px; background: var(--panel-raised);
+    border: 1px solid var(--line); color: var(--text); border-radius: 4px; padding: 6px 8px;
+  }
+  #in-ip { width: 130px; }
+  #in-port { width: 78px; }
+  #cam-wrap { position: relative; width: 100%; background: #000; border-radius: 6px; overflow: hidden; margin-bottom: 10px; min-height: 120px; }
+  #cam-video { width: 100%; display: block; }
+  #cam-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #status {
+    font-size: 10px; line-height: 1.7; color: var(--text-dim); background: var(--panel-raised);
+    border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; margin: 0 0 10px 0; white-space: pre-wrap;
+  }
+  #log { font-size: 10px; color: var(--text-dim); min-height: 14px; }
+  #log.err { color: var(--err); }
+</style>
+</head>
+<body>
+<div class="device">
+  <div class="header">MediaPipe → OSC</div>
+  <div class="body">
+
+    <div class="row">
+      <button class="tgl" id="btn-camera">CAMERA</button>
+    </div>
+    <div class="row">
+      <button class="tgl" id="btn-swap">SCAMBIA MANI</button>
+      <button class="tgl on" id="btn-left">MANO SX</button>
+      <button class="tgl on" id="btn-right">MANO DX</button>
+      <button class="tgl" id="btn-facing">CAMERA FRONTALE</button>
+    </div>
+    <div class="row">
+      <label class="f">IP destinazione <input class="f" id="in-ip" type="text" value="127.0.0.1"></label>
+      <label class="f">Porta <input class="f" id="in-port" type="number" value="7400" min="1024" max="65535"></label>
+    </div>
+
+    <div id="cam-wrap">
+      <video id="cam-video" autoplay muted playsinline></video>
+      <canvas id="cam-canvas"></canvas>
+    </div>
+
+    <pre id="status">—</pre>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+/* =========================================================================
+   DOCUMENTAZIONE DELLO SCRIPT  (mediapipe-osc.html)
+   =========================================================================
+
+   1. SCOPO
+   --------
+   Pagina web che usa la camera (del telefono o del Mac), riconosce le mani
+   con MediaPipe e invia i dati a Max/MSP come messaggi OSC su UDP.
+   Tutta l'elaborazione dell'immagine avviene nel browser: al Mac arrivano
+   solo numeri, non il video.
+
+   2. ARCHITETTURA E FLUSSO DEI DATI
+   ---------------------------------
+   camera → <video> → MediaPipe GestureRecognizer (nel browser)
+          → landmark + etichetta Left/Right + gesto
+          → OscForwarder (coda di messaggi, invio ogni 16 ms)
+          → fetch POST https://<host>:5500/osc-forward
+          → https-server.js (Node.js) converte JSON in pacchetti OSC
+          → UDP verso IP:porta (default 127.0.0.1:7400)
+          → Max/MSP [udpreceive 7400]
+
+   Perché il passaggio dal server Node: un browser non può inviare pacchetti
+   UDP. Può solo fare richieste HTTP/HTTPS, quindi https-server.js riceve il
+   POST e lo inoltra come UDP. HTTPS è obbligatorio perché i browser
+   permettono l'accesso alla camera (getUserMedia) solo su pagine HTTPS o
+   su localhost.
+
+   3. LIBRERIE ESTERNE
+   -------------------
+   @mediapipe/tasks-vision 0.10.14 (Google, caricata da cdn.jsdelivr.net):
+     - FilesetResolver.forVisionTasks(url): scarica i file WebAssembly (WASM)
+       su cui gira il motore di MediaPipe.
+     - GestureRecognizer.createFromOptions(vision, opzioni): crea il
+       riconoscitore. Opzioni usate:
+         baseOptions.modelAssetPath  URL del modello gesture_recognizer.task
+                                     (float16, circa 8 MB, scaricato la
+                                     prima volta)
+         baseOptions.delegate        "GPU" (WebGL) con ripiego su "CPU"
+         runningMode: "VIDEO"        elaborazione di fotogrammi con
+                                     timestamp, con tracciamento tra
+                                     fotogrammi
+         numHands: 2                 massimo due mani
+     - recognizeForVideo(video, timestamp): restituisce per ogni mano:
+         landmarks[i]      21 punti, ciascuno con x e y normalizzati 0..1
+                           (x da sinistra a destra, y dall'alto al basso
+                           dell'immagine) e z (profondita' relativa al
+                           polso, valori piccoli, negativi = piu' vicino
+                           alla camera)
+         handedness[i][0]  .categoryName = "Left" o "Right" (etichetta
+                           assegnata da MediaPipe)
+         gestures[i][0]    .categoryName = gesto riconosciuto e .score
+                           (confidenza 0..1). Nomi del modello: None,
+                           Closed_Fist, Open_Palm, Pointing_Up,
+                           Thumb_Down, Thumb_Up, Victory, ILoveYou.
+   Nessun'altra libreria JavaScript: il resto e' codice scritto per questa
+   pagina e API standard del browser (vedi punto 4).
+
+   4. API DEL BROWSER USATE
+   ------------------------
+   navigator.mediaDevices.getUserMedia  accesso alla camera (video 640x480)
+   <video>                              mostra e fornisce i fotogrammi
+   <canvas> 2D (getContext("2d"))       disegna lo scheletro sopra il video
+   requestAnimationFrame                ciclo di elaborazione sincronizzato
+                                        con lo schermo
+   performance.now()                    tempo in ms per timestamp e misure
+   fetch                                invio POST al server
+   setInterval                          invio code (16 ms) e pannello (500 ms)
+   import() dinamico                    carica la libreria MediaPipe solo
+                                        quando serve
+
+   5. INDIRIZZI OSC INVIATI
+   ------------------------
+   /hand/<landmark>/x   float 0..1   da sinistra a destra nell'immagine
+   /hand/<landmark>/y   float 0..1   dall'alto al basso
+       <landmark> e' uno dei 6 nomi di LM_INVIATI: wrist, thumb_tip,
+       index_tip, middle_tip, ring_tip, pinky_tip. Inviati per la mano con
+       etichetta "Left" (se MANO SX e' attiva): 12 messaggi per fotogramma
+       (circa 720 al secondo a 60 fps). La coordinata z non viene inviata.
+   /gesture/<nome>      float        1.0 a ogni fotogramma mentre il gesto
+       dura; 0.0 una sola volta quando il gesto finisce, cambia o la mano
+       scompare. Inviati per la mano con etichetta "Right" (se MANO DX e'
+       attiva). Nomi: Thumb_Up, Thumb_Down, Closed_Fist, Open_Palm,
+       Pointing_Up, Victory.
+   /gesture/<nome>/score  float 0..1  confidenza del gesto (punteggio del
+       modello). Viene inviato subito PRIMA di /gesture/<nome>, a ogni
+       fotogramma, e vale 0.0 quando il gesto finisce. Serve per applicare
+       la soglia di confidenza in Max (vedi gesti_hold.maxpat).
+   Ogni messaggio OSC ha un solo argomento di tipo float32 ("f").
+
+   6. COSTANTI GLOBALI
+   -------------------
+   LM_NAMES       array di 21 nomi dei landmark, nell'ordine dei punti di
+                  MediaPipe (0 = wrist, 1-4 = pollice, 5-8 = indice,
+                  9-12 = medio, 13-16 = anulare, 17-20 = mignolo; suffissi
+                  mcp = nocca, pip/dip = articolazioni intermedie,
+                  tip = punta).
+   LM_INVIATI     indici dei 6 landmark inviati a Max: [0, 4, 8, 12, 16, 20]
+                  (wrist e le 5 punte delle dita). Ridotti da 21 perche' il
+                  traffico UDP (63 messaggi per fotogramma) saturava
+                  udpreceive di Max.
+   CONNECTIONS    coppie di indici di landmark da unire con una linea per
+                  disegnare lo scheletro.
+   GESTI          insieme dei sei gesti inviati; gli altri nomi restituiti
+                  dal modello (None, ILoveYou) vengono ignorati.
+   Altre costanti nel codice: 16 (ms tra invii e tra svuotamenti della
+   coda), 120 (misure conservate per le medie in Stats), 500 (ms tra
+   aggiornamenti del pannello di stato), 5500 (porta HTTPS del server),
+   7400 (porta UDP di default verso Max), 640x480 (risoluzione richiesta
+   alla camera), colori #5fd97a (verde, mano "Left") e #ff6a3d (arancione,
+   mano "Right").
+
+   7. OGGETTI E FUNZIONI
+   ---------------------
+   Stats        Calcola medie e massimi su una finestra di 120 misure.
+     add(k, v)     aggiunge una misura alla serie k, scarta le piu' vecchie.
+     mean(k)       media della serie k (null se vuota).
+     max(k)        massimo della serie k.
+     Serie usate: "frame" (ms tra fotogrammi), "infer" (durata inferenza),
+     "fwd" (durata della richiesta al server), "fwdErr" (errori di invio),
+     "lat" (latenza fotogramma -> UDP, vedi punto 10).
+
+   logMsg(text, isErr)   scrive un messaggio nella riga di log in fondo
+                         alla pagina; se isErr e' true il testo e' rosso.
+
+   OscForwarder   Raccoglie i messaggi e li spedisce al server.
+     enabled, ip, port, sent   stato e destinazione (sempre attivo).
+     add(address, args)        mette un messaggio in coda, con l'istante del
+                               fotogramma da cui nasce (Cam._frameT).
+     flush()                   chiamata ogni 16 ms: prende tutta la coda e
+                               la invia in un unico POST (batch) per
+                               ridurre il numero di richieste. Se una
+                               richiesta e' ancora in corso (_sending),
+                               salta il turno, cosi' non se ne accumulano.
+
+   Cam   Gestisce camera, riconoscimento e invio.
+     init()        carica la libreria e il modello GestureRecognizer
+                   (prima GPU, poi CPU se la GPU non e' disponibile).
+     start()       inizializza se serve, apre la camera, avvia _loop().
+     stop()        ferma il ciclo e la camera, pulisce il canvas e manda 0
+                   al gesto eventualmente attivo.
+     _loop()       a ogni fotogramma: chiama recognizeForVideo, poi
+                   _process (invio OSC) e _draw (disegno), quindi si
+                   riprogramma con requestAnimationFrame.
+     _label(results, i)   etichetta Left/Right della mano i; con SCAMBIA
+                   MANI le due etichette vengono invertite.
+     _setGesture(g)       gestisce il gesto attivo: se cambia manda 0 al
+                   precedente, manda 1.0 al nuovo a ogni fotogramma.
+     _process(results)    per ogni mano: se l'etichetta e' "Left" e MANO SX
+                   e' attiva invia x e y dei 6 landmark di LM_INVIATI; se e' "Right"
+                   e MANO DX e' attiva legge il gesto dal modello (solo se
+                   fa parte di GESTI). Alla fine chiama _setGesture.
+     _draw(results)       disegna linee e punti dello scheletro e il tag
+                   SX/DX sotto la mano (verde = Left, arancione = Right).
+     Proprieta': running, mirror (sempre false), swap, useLeft, useRight,
+     _frameT, _lastScore,
+     facing ("user" frontale, "environment" posteriore), _handsNow,
+     _lastGesture, _activeGesture.
+
+   8. INTERFACCIA
+   --------------
+   CAMERA            accende/spegne la camera (verde = accesa).
+   SCAMBIA MANI      inverte le etichette Left/Right (rosso = attivo).
+   MANO SX           attiva/disattiva l'invio dei landmark (rosso = attivo).
+   MANO DX           attiva/disattiva l'invio dei gesti (rosso = attivo).
+   CAMERA FRONTALE / POSTERIORE   sceglie la camera (utile sul telefono).
+   IP destinazione, Porta         indirizzo UDP di Max (di default
+                                  127.0.0.1:7400).
+   La soglia di confidenza non e' nella pagina: i gesti vengono inviati
+   sempre, con il punteggio in /gesture/<nome>/score, e la soglia si regola
+   in Max (gesti_hold.maxpat). Sale = piu' sicuro ma piu' lento a reagire;
+   scende = piu' reattivo ma piu' errori.
+   Pannello di stato: mani rilevate, gesto, FPS, durata inferenza,
+   messaggi inviati, durata della richiesta al server, errori.
+
+   9. NOTE SUL RICONOSCIMENTO DEI GESTI
+   ------------------------------------
+   I gesti non sono calcolati dal codice della pagina: li restituisce il
+   modello di MediaPipe (rete neurale addestrata da Google). Il vecchio
+   classificatore geometrico (confronto tra posizioni di punta e
+   articolazione delle dita) e' conservato nel file
+   mediapipe-osc_geometrico_backup.html.
+   10. LATENZA
+   -----------
+   Latenza fotogramma -> UDP (riga nel pannello di stato): tempo tra
+   l'inizio dell'elaborazione di un fotogramma (Cam._frameT, subito prima di
+   recognizeForVideo) e il momento in cui il server ha risposto al POST, cioe'
+   ha inoltrato il pacchetto UDP. Comprende: inferenza + attesa nella coda
+   (fino a 16 ms) + richiesta al server. Per ogni batch si usa il messaggio
+   piu' vecchio. Non comprende il ritardo di acquisizione della camera, ne'
+   il percorso di rete UDP e l'elaborazione in Max, che non sono misurabili
+   dalla pagina.
+   Righe correlate: "inferenza" (solo il modello) e "fetch -> server" (solo
+   la richiesta).
+   ========================================================================= */
+
+// -------------------------------------------------------------------------
+// Indirizzi OSC inviati (stessi dell'app Stranger Synths):
+//   /hand/<landmark>/x  /y         (mano con etichetta "Left"; solo i 6 landmark di LM_INVIATI)
+//   /gesture/<nome> [1.0 mentre il gesto dura, 0.0 una volta quando finisce]   (mano "Right", gesto dal modello MediaPipe)
+//   /gesture/<nome>/score [confidenza 0..1 del gesto, inviata subito prima di /gesture/<nome>; 0.0 alla fine]
+// L'invio passa da https-server.js (/osc-forward) che inoltra via UDP.
+// -------------------------------------------------------------------------
+
+const LM_NAMES = [
+  "wrist","thumb_cmc","thumb_mcp","thumb_ip","thumb_tip",
+  "index_mcp","index_pip","index_dip","index_tip",
+  "middle_mcp","middle_pip","middle_dip","middle_tip",
+  "ring_mcp","ring_pip","ring_dip","ring_tip",
+  "pinky_mcp","pinky_pip","pinky_dip","pinky_tip"
+];
+
+// Gesti del modello inviati a Max (None e ILoveYou vengono ignorati)
+const GESTI = new Set(["Thumb_Up","Thumb_Down","Closed_Fist","Open_Palm","Pointing_Up","Victory"]);
+
+// Landmark inviati a Max (solo x e y): wrist, thumb_tip, index_tip, middle_tip, ring_tip, pinky_tip.
+// Gli altri 15 punti vengono rilevati e disegnati ma non inviati, per ridurre il traffico UDP.
+const LM_INVIATI = [0, 4, 8, 12, 16, 20];
+
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],[0,5]
+];
+
+// ---- Latenza (media su ultime 120 misure) ----
+const Stats = {
+  _d: {},
+  add(k, v) { const a = this._d[k] || (this._d[k] = []); a.push(v); if (a.length > 120) a.shift(); },
+  mean(k) { const a = this._d[k]; return a && a.length ? a.reduce((x, y) => x + y, 0) / a.length : null; },
+  max(k)  { const a = this._d[k]; return a && a.length ? Math.max(...a) : null; },
+};
+
+function logMsg(text, isErr) {
+  const el = document.getElementById("log");
+  el.textContent = text;
+  el.className = isErr ? "err" : "";
+}
+
+// ---- Forwarding OSC ----
+const OscForwarder = {
+  enabled: true,
+  ip: "127.0.0.1",
+  port: 7400,
+  _queue: [],
+  _sending: false,
+  sent: 0,
+
+  // t = istante (performance.now) in cui e' iniziata l'elaborazione del fotogramma
+  // da cui nasce il messaggio: serve a misurare la latenza fotogramma -> UDP.
+  add(address, args) {
+    if (!this.enabled) return;
+    this._queue.push({ address, args, t: Cam._frameT });
+  },
+
+  async flush() {
+    if (!this.enabled || this._queue.length === 0 || this._sending) return;
+    const batch = this._queue.splice(0, this._queue.length);
+    this._sending = true;
+    const t0 = performance.now();
+    let tOld = Infinity;
+    for (const m of batch) if (m.t < tOld) tOld = m.t;
+    try {
+      await fetch(`https://${location.hostname}:5500/osc-forward`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip: this.ip, port: this.port, messages: batch.map(({ address, args }) => ({ address, args })) }),
+      });
+      const t1 = performance.now();
+      Stats.add("fwd", t1 - t0);
+      if (tOld !== Infinity) Stats.add("lat", t1 - tOld);
+      this.sent += batch.length;
+    } catch (_) {
+      Stats.add("fwdErr", 1);
+    }
+    this._sending = false;
+  },
+};
+setInterval(() => OscForwarder.flush(), 16);
+
+// ---- Camera + MediaPipe ----
+const Cam = {
+  running: false,
+  mirror: false,
+  swap: false,
+  useLeft: true,
+  useRight: true,
+  _frameT: 0,             // istante di inizio elaborazione dell'ultimo fotogramma
+  _lastScore: null,       // confidenza dell'ultimo gesto accettato
+  facing: "user",
+  _rec: null,
+  _video: null,
+  _canvas: null,
+  _ctx: null,
+  _raf: null,
+  _lastFrame: 0,
+  _handsNow: 0,
+  _lastGesture: "—",
+  _activeGesture: null,   // gesto attualmente inviato con valore 1
+
+  async init() {
+    const { FilesetResolver, GestureRecognizer } = await import(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+    );
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    const make = (delegate) => GestureRecognizer.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/latest/gesture_recognizer.task",
+        delegate,
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+    try {
+      this._rec = await make("GPU");
+    } catch (_) {
+      this._rec = await make("CPU");
+    }
+  },
+
+  async start() {
+    if (this.running) return;
+    if (!this._rec) {
+      logMsg("Caricamento MediaPipe…");
+      await this.init();
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: this.facing }
+    });
+    this._video = document.getElementById("cam-video");
+    this._canvas = document.getElementById("cam-canvas");
+    this._ctx = this._canvas.getContext("2d");
+    this._video.srcObject = stream;
+    await this._video.play();
+    this.running = true;
+    this._lastFrame = 0;
+    logMsg("Camera attiva");
+    this._loop();
+  },
+
+  stop() {
+    this.running = false;
+    if (this._raf) cancelAnimationFrame(this._raf);
+    if (this._video && this._video.srcObject) {
+      this._video.srcObject.getTracks().forEach(t => t.stop());
+      this._video.srcObject = null;
+    }
+    if (this._ctx) this._ctx.clearRect(0, 0, this._canvas.width, this._canvas.height);
+    this._setGesture(null);
+    this._handsNow = 0;
+  },
+
+  _loop() {
+    if (!this.running) return;
+    const video = this._video;
+    if (video.readyState >= 2) {
+      const now = performance.now();
+      if (this._lastFrame) Stats.add("frame", now - this._lastFrame);
+      this._lastFrame = now;
+      this._frameT = now;
+      const results = this._rec.recognizeForVideo(video, now);
+      Stats.add("infer", performance.now() - now);
+      this._process(results);
+      this._draw(results);
+    }
+    this._raf = requestAnimationFrame(() => this._loop());
+  },
+
+  _label(results, i) {
+    let label = (results.handedness ?? results.handednesses)?.[i]?.[0]?.categoryName ?? "Right";
+    if (this.swap) label = label === "Right" ? "Left" : "Right";
+    return label;
+  },
+
+  // Imposta il gesto attivo: 1 finché dura, 0 una volta quando finisce o cambia.
+  _setGesture(g) {
+    if (this._activeGesture && this._activeGesture !== g) {
+      OscForwarder.add(`/gesture/${this._activeGesture}/score`, [0.0]);
+      OscForwarder.add(`/gesture/${this._activeGesture}`, [0.0]);
+    }
+    if (g) {
+      // il punteggio parte PRIMA del gesto, cosi' in Max e' gia' disponibile quando arriva l'1
+      OscForwarder.add(`/gesture/${g}/score`, [this._lastScore ?? 1.0]);
+      OscForwarder.add(`/gesture/${g}`, [1.0]);
+    }
+    this._activeGesture = g || null;
+    this._lastGesture = g || "—";
+  },
+
+  _process(results) {
+    const n = results.landmarks ? results.landmarks.length : 0;
+    this._handsNow = n;
+    if (n === 0) {
+      this._setGesture(null);
+      return;
+    }
+    let gestureNow = null;
+    for (let i = 0; i < n; i++) {
+      const lm = results.landmarks[i];
+      const label = this._label(results, i);
+
+      if (label === "Left" && this.useLeft) {
+        for (const j of LM_INVIATI) {
+          const x = this.mirror ? 1 - lm[j].x : lm[j].x;
+          OscForwarder.add(`/hand/${LM_NAMES[j]}/x`, [x]);
+          OscForwarder.add(`/hand/${LM_NAMES[j]}/y`, [lm[j].y]);
+        }
+      }
+
+      if (label === "Right" && this.useRight) {
+        const top = results.gestures?.[i]?.[0];
+        if (top && GESTI.has(top.categoryName)) {
+          gestureNow = top.categoryName;
+          this._lastScore = top.score;
+        }
+      }
+    }
+    this._setGesture(gestureNow);
+  },
+
+  _draw(results) {
+    const c = this._canvas, ctx = this._ctx, v = this._video;
+    c.width = v.videoWidth || 640;
+    c.height = v.videoHeight || 480;
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (!results.landmarks) return;
+    for (let i = 0; i < results.landmarks.length; i++) {
+      const lm = results.landmarks[i];
+      const color = this._label(results, i) === "Left" ? "#5fd97a" : "#ff6a3d";
+      const px = (p) => (this.mirror ? 1 - p.x : p.x) * c.width;
+      const py = (p) => p.y * c.height;
+      ctx.strokeStyle = color; ctx.lineWidth = 2;
+      for (const [s, e] of CONNECTIONS) {
+        ctx.beginPath(); ctx.moveTo(px(lm[s]), py(lm[s])); ctx.lineTo(px(lm[e]), py(lm[e])); ctx.stroke();
+      }
+      ctx.fillStyle = color;
+      for (const p of lm) { ctx.beginPath(); ctx.arc(px(p), py(p), 4, 0, Math.PI * 2); ctx.fill(); }
+      const isLeft = this._label(results, i) === "Left";
+      let maxY = 0, sumX = 0;
+      for (const p of lm) { maxY = Math.max(maxY, py(p)); sumX += px(p); }
+      const tag = isLeft ? "SX" : "DX";
+      ctx.font = "bold 22px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.fillText(tag, sumX / lm.length, Math.min(maxY + 8, c.height - 26));
+    }
+  },
+};
+
+// ---- UI ----
+function setTgl(id, on, textOn, textOff) {
+  const b = document.getElementById(id);
+  b.classList.toggle("on", on);
+  b.textContent = on ? textOn : textOff;
+}
+
+document.getElementById("btn-camera").addEventListener("click", async () => {
+  if (Cam.running) {
+    Cam.stop();
+    setTgl("btn-camera", false, "CAMERA", "CAMERA");
+    logMsg("Camera ferma");
+    return;
+  }
+  try {
+    await Cam.start();
+    setTgl("btn-camera", true, "CAMERA", "CAMERA");
+  } catch (e) {
+    setTgl("btn-camera", false, "CAMERA", "CAMERA");
+    logMsg("Errore: " + e.message, true);
+  }
+});
+
+document.getElementById("btn-swap").addEventListener("click", () => {
+  Cam.swap = !Cam.swap;
+  setTgl("btn-swap", Cam.swap, "SCAMBIA MANI", "SCAMBIA MANI");
+});
+
+document.getElementById("btn-left").addEventListener("click", () => {
+  Cam.useLeft = !Cam.useLeft;
+  setTgl("btn-left", Cam.useLeft, "MANO SX", "MANO SX");
+});
+
+document.getElementById("btn-right").addEventListener("click", () => {
+  Cam.useRight = !Cam.useRight;
+  setTgl("btn-right", Cam.useRight, "MANO DX", "MANO DX");
+});
+
+// Cambia camera frontale/posteriore (utile sul telefono). Se la camera è attiva la riavvia.
+document.getElementById("btn-facing").addEventListener("click", async () => {
+  Cam.facing = Cam.facing === "user" ? "environment" : "user";
+  document.getElementById("btn-facing").textContent =
+    Cam.facing === "user" ? "CAMERA FRONTALE" : "CAMERA POSTERIORE";
+  if (Cam.running) {
+    Cam.stop();
+    try { await Cam.start(); } catch (e) { logMsg("Errore: " + e.message, true); }
+  }
+});
+
+// Forwarding e gesti sono sempre attivi. Se il campo IP/porta cambia, si aggiorna il bersaglio.
+for (const id of ["in-ip", "in-port"]) {
+  document.getElementById(id).addEventListener("change", () => {
+    OscForwarder.ip = document.getElementById("in-ip").value.trim() || "127.0.0.1";
+    OscForwarder.port = parseInt(document.getElementById("in-port").value) || 7400;
+  });
+}
+
+// Pannello di stato (aggiornato ogni 500 ms)
+setInterval(() => {
+  const f = (v) => v == null ? "—" : v.toFixed(1);
+  const fr = Stats.mean("frame");
+  document.getElementById("status").textContent =
+    `mani rilevate: ${Cam._handsNow}   gesto: ${Cam._lastGesture}${Cam._activeGesture && Cam._lastScore != null ? " (" + Cam._lastScore.toFixed(2) + ")" : ""}\n` +
+    `FPS: ${fr ? (1000 / fr).toFixed(1) : "—"}   inferenza: ${f(Stats.mean("infer"))} ms (max ${f(Stats.max("infer"))})\n` +
+    `forwarding: ${OscForwarder.enabled ? "ON" : "OFF"}   messaggi inviati: ${OscForwarder.sent}\n` +
+    `fetch → server: ${f(Stats.mean("fwd"))} ms (max ${f(Stats.max("fwd"))})   errori: ${(Stats._d.fwdErr || []).length}\n` +
+    `latenza fotogramma → UDP: ${f(Stats.mean("lat"))} ms (max ${f(Stats.max("lat"))})`;
+}, 500);
+</script>
+</body>
+</html>
